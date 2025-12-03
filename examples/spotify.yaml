@@ -1,0 +1,97 @@
+{% set elements = [] %}
+{% set t = now().timestamp() %} 
+{% set is_playing = is_state('media_player.spotify', 'playing') %} 
+{% set screen_w = 64 %}
+{% if is_playing %}
+
+
+  {% set elements = elements + [{
+      "type": "icon",
+      "name": "mdi:spotify",
+      "x": 47,
+      "y": -1,
+      "size": 18,
+      "color": [10, 255, 10, 105]
+  }] %}
+  
+  {% set artist = state_attr('media_player.spotify', 'media_artist') | default('Unknown') %}
+  {% set title = state_attr('media_player.spotify', 'media_title') | default('Track') %}
+
+  {% set elements = elements + [{
+      "type": "textlong",
+      "content": artist,
+      "x": 0,
+      "y": 4,
+      "font": "awtrix",
+      "color": [200, 200, 200],
+      "speed": 4.0,
+      "scroll_duration": 1.5,
+      "direction": "down"
+  }] %}
+
+  {% set elements = elements + [{
+      "type": "textlong",
+      "content": title,
+      "x": 0,
+      "y": 10,
+      "font": "awtrix",
+      "color": [200, 200, 200],
+      "speed": 4.0,
+      "scroll_duration": 1.5,
+      "direction": "left"
+  }] %}
+
+
+  
+
+  
+  {% set duration = state_attr('media_player.spotify', 'media_duration') | float(1) %}
+  {% set position = state_attr('media_player.spotify', 'media_position') | float(0) %}
+  {% set last_upd = as_timestamp(state_attr('media_player.spotify', 'media_position_updated_at')) | default(t) %}
+
+  {% set current_pos = position + (t - last_upd) %}
+  {% if current_pos > duration %} {% set current_pos = duration %} {% endif %}
+
+  {% set pct = current_pos / duration %}
+  {% set dot_x = (pct * (screen_w - 1)) | int %}
+
+  {% set bar_bg_dark = [150, 150, 150, 80] %}
+  {% set dot_green = [10, 150, 0, 140] %}
+  {% set dot_center = [10, 80, 0, 140] %}
+
+  {% set ns = namespace(pixels=[]) %}
+  
+  {# {% set elements = elements + [{
+      "type": "text",
+      "content": last_upd,
+      "x": 45,
+      "y": 10,
+      "font": "awtrix",
+      "color": [200, 200, 200],
+  }] %} #}
+
+  
+  {% for x in range(0, screen_w) %}
+      {% set ns.pixels = ns.pixels + [[x, 0] + bar_bg_dark] %}
+  {% endfor %}
+
+
+  {% for dx in range(dot_x - 2, dot_x + 1) %}
+      {% for dy in range(0, 2) %}
+          {% if dx >= 0 and dx < screen_w %}
+              {% if dx == dot_x and dy == 14 %}
+                  {% set col = dot_center %}
+              {% else %}
+                  {% set col = dot_green %}
+              {% endif %}
+              {% set ns.pixels = ns.pixels + [[dx, dy] + col] %}
+          {% endif %}
+      {% endfor %}
+  {% endfor %}
+
+  {% set elements = elements + [{
+      "type": "pixels",
+      "pixels": ns.pixels
+  }] %}
+{% endif %}
+{{ elements }}
