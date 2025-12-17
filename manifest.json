@@ -1,10 +1,10 @@
 {
-  "domain": "ump",
-  "name": "UnexpectedMatrixPixels",
-  "codeowners": [],
+  "domain": "unexpected_matrix_pixels",
+  "name": "Unexpected Matrix Pixels",
+  "codeowners": ["@suchyindustries"],
   "config_flow": true,
-  "documentation": "",
-  "issue_tracker": "",
+  "documentation": "https://github.com/suchyindustries/UnexpectedMatrixPixels",
+  "issue_tracker": "https://github.com/suchyindustries/UnexpectedMatrixPixels/issues",
   "requirements": [
     "pillow>=10.0.0",
     "bleak",
