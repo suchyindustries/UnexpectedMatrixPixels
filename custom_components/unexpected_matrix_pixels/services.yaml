@@ -3,7 +3,7 @@ draw_visuals:
   description: Advanced drawing on the matrix (text, pixels, images, icons).
   target:
     entity:
-      integration: ump
+      integration: unexpected_matrix_pixels
   fields:
     background:
       name: Background RGB
@@ -23,7 +23,7 @@ draw_visuals:
       name: Visual Elements
       description: >-
         List of elements. Supported types:
-        - text: content, x, y, color, font ("3x5" or "5x7"), spacing
+        - text: content, x, y, color [R, G, B], font ("3x5" or "5x7" or "awtrix"), spacing
         - textscroll: content, y, color, font, speed (pixels/sec), spacing
         - textlong: content, x, y, color, font, speed (hold duration), scroll_duration, direction (up, down, left, right)
         - pixels: pixels=[[x, y, r, g, b], ...]
@@ -46,13 +46,13 @@ clear_display:
   description: Clears the screen.
   target:
     entity:
-      integration: ump
+      integration: unexpected_matrix_pixels
 
 sync_time:
   name: Sync Time
   description: Synchronize display clock with HA time.
   target:
     entity:
-      integration: ump
+      integration: unexpected_matrix_pixels
 
 
