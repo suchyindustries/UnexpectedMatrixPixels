@@ -1,16 +1,16 @@
 {
-  "domain": "ump",
-  "name": "UnexpectedMatrixPixels",
-  "codeowners": [],
+  "domain": "unexpected_matrix_pixels",
+  "name": "Unexpected Matrix Pixels",
+  "codeowners": ["@suchyindustries"],
   "config_flow": true,
-  "documentation": "",
-  "issue_tracker": "",
+  "documentation": "https://github.com/suchyindustries/UnexpectedMatrixPixels",
+  "issue_tracker": "https://github.com/suchyindustries/UnexpectedMatrixPixels/issues",
   "requirements": [
     "pillow>=10.0.0",
     "bleak",
     "bleak-retry-connector>=1.0.0"
   ],
-  "version": "1.0.0",
+  "version": "1.0.1",
   "iot_class": "local_polling",
   "integration_type": "device",
   "bluetooth": [

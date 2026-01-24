@@ -1,4 +1,4 @@
-DOMAIN = "ump"
+DOMAIN = "unexpected_matrix_pixels"
 CONF_MAC_ADDRESS = "mac_address"
 CONF_WIDTH = "width"
 CONF_HEIGHT = "height"

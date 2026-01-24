@@ -1,0 +1,6 @@
+{
+  "name": "Unexpected Matrix Pixels",
+  "domain": "unexpected_matrix_pixels",
+  "content_in_root": false,
+  "iot_class": "local_polling"
+}
