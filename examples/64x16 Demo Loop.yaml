@@ -1,7 +1,6 @@
 alias: "Pixel Matrix: 64x16 Demo Loop"
 description: >-
-  Demonstracja dla szerokiego ekranu 64x16: Zegar, Pogoda, Grafika i
-  Powiadomienia.
+  Demo
 triggers:
   - seconds: /10
     trigger: time_pattern
