@@ -98,5 +98,5 @@ data:
     {% endif %}
     {{ elements }}
   fps: 4
-action: ump.draw_visuals
+action: unexpected_matrix_pixels.draw_visuals
 
