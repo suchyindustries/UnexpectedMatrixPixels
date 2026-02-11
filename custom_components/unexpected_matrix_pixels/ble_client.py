@@ -19,6 +19,10 @@ class UmpBleClient:
         self._client: Optional[BleakClient] = None
         self._lock = asyncio.Lock()
         self._last_image_bytes: Optional[bytes] = None
+        
+        # Stability Flag - Detect if device is LED_BLE (iPixel) which needs reliable writes, or IDM which can handle fast writes
+        self._is_led_ble = False
+        
         self._init_default_image()
 
     def _init_default_image(self):
@@ -39,9 +43,17 @@ class UmpBleClient:
         async with self._lock:
             if self._client and self._client.is_connected:
                 return
+            
             device = bluetooth.async_ble_device_from_address(self._hass, self._mac, connectable=True)
             if device is None:
                 raise ConnectionError(f"UMP {self._mac} not available")
+            
+            name = device.name or ""
+            if "LED_BLE" in name:
+                self._is_led_ble = True  # iPixel needs reliable writes
+            else:
+                self._is_led_ble = False # IDM works fine with fast writes
+                
             try:
                 self._client = await establish_connection(
                     BleakClient,
@@ -58,6 +70,7 @@ class UmpBleClient:
     async def write_gatt(self, data: bytes, response: bool = False) -> None:
         await self.ensure_connected()
         try:
+            # Use detected stability mode if generic write
             await self._client.write_gatt_char(IDM_CHAR_WRITE, data, response=response)
         except Exception:
             if self._client:
@@ -71,11 +84,13 @@ class UmpBleClient:
     async def set_state(self, on: bool) -> None:
         val = 1 if on else 0
         cmd = bytearray([0x06, 0x00, 0x04, 0x00, 0x01, 0x00, val])
-        await self.write_gatt(cmd)
+        # Control commands are short, usually safe with response=False or True
+        # Using False for speed, logic mostly handled in main loop
+        await self.write_gatt(cmd, response=True) 
 
     async def set_mode(self, mode: int) -> None:
         cmd = bytearray([0x06, 0x00, 0x03, 0x00, 0x01, 0x00, mode])
-        await self.write_gatt(cmd)
+        await self.write_gatt(cmd, response=True)
 
     async def clear(self) -> None:
         img = Image.new('RGB', (self._width, self._height), color='black')
@@ -91,7 +106,7 @@ class UmpBleClient:
             now.tm_hour, now.tm_min, now.tm_sec, 
             now.tm_wday + 1
         ])
-        await self.write_gatt(cmd)
+        await self.write_gatt(cmd, response=True)
 
     @staticmethod
     def _create_image_payloads(png_data: bytes) -> bytearray:
@@ -110,6 +125,7 @@ class UmpBleClient:
             img = img.resize((self._width, self._height), Image.Resampling.NEAREST)
         if img.mode != 'RGB':
             img = img.convert('RGB')
+            
         img_byte_arr = BytesIO()
         img.save(img_byte_arr, format='PNG')
         png_data = img_byte_arr.getvalue()
@@ -118,12 +134,20 @@ class UmpBleClient:
         
         payloads = self._create_image_payloads(png_data)
         chunks = [payloads[i:i + 512] for i in range(0, len(payloads), 512)]
+        
         await self.ensure_connected()
+        
+        # Init command
         init_data = bytearray([10, 0, 5, 1, 0, 0, 0, 0, 0, 0])
         await self._client.write_gatt_char(IDM_CHAR_WRITE, bytes(init_data), response=True)
         await asyncio.sleep(0.05)
+        
+        # If LED_BLE (iPixel), use response=True to prevent freezing.
+        # If IDM, use response=False for high FPS.
+        use_response = self._is_led_ble
+        
         for chunk in chunks:
-            await self._client.write_gatt_char(IDM_CHAR_WRITE, bytes(chunk), response=False) 
+            await self._client.write_gatt_char(IDM_CHAR_WRITE, bytes(chunk), response=use_response)
 
     async def send_frame_dict(self, pixels: Dict[Tuple[int, int], Tuple[int, int, int]]) -> None:
         img = Image.new('RGB', (self._width, self._height), color='black')

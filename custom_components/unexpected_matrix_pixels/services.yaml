@@ -1,58 +1,63 @@
-draw_visuals:
-  name: Draw Visuals
-  description: Advanced drawing on the matrix (text, pixels, images, icons).
+draw_matrix:
+  name: Draw Matrix
+  description: Draws content on the LED matrix with optional transition effects.
   target:
     entity:
       integration: unexpected_matrix_pixels
   fields:
-    background:
-      name: Background RGB
-      description: Background color [r,g,b].
-      example: [0, 0, 0]
-      selector:
-        color_rgb:
-    fps:
-      name: Max FPS
-      description: Maximum frames per second (1-30). Lower value = better stability. Default 10.
-      example: 10
-      selector:
-        number:
-          min: 1
-          max: 30
     elements:
       name: Visual Elements
       description: >-
-        List of elements. Supported types:
-        - text: content, x, y, color [R, G, B], font ("3x5" or "5x7" or "awtrix"), spacing
-        - textscroll: content, y, color, font, speed (pixels/sec), spacing
-        - textlong: content, x, y, color, font, speed (hold duration), scroll_duration, direction (up, down, left, right)
+        List of elements to draw.
+        Supported types:
+        - text: content, x, y, color [R,G,B], font ("5x7", "3x5", "awtrix"), spacing
+        - icon: name (e.g. mdi:home), x, y, size, color
         - pixels: pixels=[[x, y, r, g, b], ...]
-        - image: x, y, path (local) OR url (http), width (opt), height (opt)
-        - icon: name (e.g., mdi:home), x, y, size, color
+        - image: path (local) OR url (http), x, y, width, height
       required: true
-      example: |
-        - type: textlong
-          content: "Scrolling Text"
-          y: 5
-          color: [0, 255, 255]
-          speed: 2.0
-          scroll_duration: 0.5
-          direction: "up"
       selector:
         object:
+      example: |
+        - type: text
+          content: "HELLO"
+          x: 5
+          y: 10
+          color: [0, 255, 0]
+          font: "5x7"
+        - type: icon
+          name: "mdi:weather-sunny"
+          x: 30
+          y: 0
+          size: 16
+          color: [255, 255, 0]
+
+    background:
+      name: Background Color
+      description: Background RGB color [R, G, B].
+      required: false
+      default: [0, 0, 0]
+      selector:
+        color_rgb:
+
+    transition:
+      name: Transition Settings
+      description: >-
+        Optional transition animation settings. If omitted, draws immediately.
+        Fields:
+        - type: "slide_up", "slide_down", "slide_left", "slide_right", "dissolve"
+        - duration: seconds (float, default 1.0)
+        - fps: frames per second (int, default 20)
+      required: false
+      selector:
+        object:
+      example: |
+        type: slide_up
+        duration: 0.8
+        fps: 20
 
 clear_display:
   name: Clear Display
-  description: Clears the screen.
+  description: Clears the screen (black) and resets internal state.
   target:
     entity:
       integration: unexpected_matrix_pixels
-
-sync_time:
-  name: Sync Time
-  description: Synchronize display clock with HA time.
-  target:
-    entity:
-      integration: unexpected_matrix_pixels
-
-
