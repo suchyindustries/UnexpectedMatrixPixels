@@ -1,7 +1,7 @@
 # 🎨 UnexpectedMatrixPixels (UMP)
 
-new version, you need to rewrite your automations.
-check https://github.com/suchyindustries/UnexpectedMatrixPixels/tree/main/examples
+new version, ~~you need to rewrite your automations.
+check https://github.com/suchyindustries/UnexpectedMatrixPixels/tree/main/examples~~
 
 
 Propably fix both:
