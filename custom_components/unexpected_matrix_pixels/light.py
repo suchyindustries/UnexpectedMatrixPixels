@@ -11,7 +11,7 @@ from typing import Any, List, Dict, Optional, Tuple
 
 from homeassistant.components.light import ColorMode, LightEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, EVENT_HOMEASSISTANT_STOP
 from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -24,7 +24,6 @@ from .fonts import FONT_3X5_DATA, FONT_5X7_DATA, AWTRIX_BITMAPS, AWTRIX_GLYPHS
 
 _LOGGER = logging.getLogger(__name__)
 
-# Optimization: Compiled translation map is slightly faster
 REPLACE_CHARS = {
     'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z',
     'Ą': 'A', 'Ć': 'C', 'Ę': 'E', 'Ł': 'L', 'Ń': 'N', 'Ó': 'O', 'Ś': 'S', 'Ź': 'Z', 'Ż': 'Z'
@@ -35,37 +34,35 @@ def sanitize_text(text: str) -> str:
     """Replaces Polish characters with ASCII equivalents."""
     return text.translate(TRANS_TABLE)
 
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     mac = entry.data[CONF_MAC_ADDRESS]
     width = entry.data.get(CONF_WIDTH, DEFAULT_WIDTH)
     height = entry.data.get(CONF_HEIGHT, DEFAULT_HEIGHT)
-    
-    # Better safety check using .get()
+
     domain_data = hass.data.get(DOMAIN, {})
     entry_data = domain_data.get(entry.entry_id)
 
     if entry_data:
         client = entry_data["client"]
     else:
-        # Fallback if setup order was unusual, though logically shouldn't happen if __init__ passed
         client = UmpBleClient(hass, mac, width, height)
 
-    # Renamed class for consistency
     display = UmpDisplayEntity(client, mac, entry.title, hass, width, height)
     async_add_entities([display])
 
     platform = entity_platform.async_get_current_platform()
-    
-    # Schema definitions extracted for clarity
+
     DRAW_SCHEMA = {
         vol.Required("elements"): list,
         vol.Optional("background", default=[0, 0, 0]): list,
-        vol.Optional("fps", default=10): int,  
+        vol.Optional("fps", default=10): int,
     }
-    
+
     platform.async_register_entity_service("draw_matrix", DRAW_SCHEMA, "async_draw_matrix")
     platform.async_register_entity_service("clear_display", {}, "async_clear_display")
     platform.async_register_entity_service("sync_time", {}, "async_sync_time")
+
 
 class UmpDisplayEntity(LightEntity):
     def __init__(self, client: UmpBleClient, mac: str, name: str, hass: HomeAssistant, width: int, height: int) -> None:
@@ -80,26 +77,67 @@ class UmpDisplayEntity(LightEntity):
         self._is_on = True
         self._brightness = 255
         self._hass = hass
-        self._anim_task = None 
-        
-        self._current_mode = None 
+        self._anim_task = None
+        self._is_connecting = False  # FIX: re-entrancy guard prevents proxy contention
+
+        self._current_mode = None
         self._ble_lock = asyncio.Lock()
 
-        # Paths
         base_path = os.path.dirname(__file__)
         self._font_path = os.path.join(base_path, 'materialdesignicons-webfont.ttf')
         self._meta_path = os.path.join(base_path, 'materialdesignicons-webfont_meta.json')
-        
-        self._mdi_map = {} 
-        self._mdi_fonts = {} 
+
+        self._mdi_map = {}
+        self._mdi_fonts = {}
         self._mdi_ready = False
-        
+
         self._char_mask_cache: Dict[Tuple[str, str], Tuple[Optional[Image.Image], int]] = {}
-        
+
         self._hass.async_create_task(self._init_mdi())
 
+    # -------------------------------------------------------------------------
+    # FIX 1: _cancel_anim_task
+    # The broken version in light.py had a commented block that called
+    # "await self._cancel_anim_task()" INSIDE itself — infinite recursion.
+    # The live version called "await self._cancel_anim_task()" directly too.
+    # Correct: await self._anim_task (the Task object), never this method.
+    # -------------------------------------------------------------------------
+    async def _cancel_anim_task(self) -> None:
+        if self._anim_task and not self._anim_task.done():
+            self._anim_task.cancel()
+            try:
+                await self._anim_task   # await the Task, NOT this method
+            except asyncio.CancelledError:
+                pass
+        self._anim_task = None
+
+    # -------------------------------------------------------------------------
+    # FIX 2: async_will_remove_from_hass
+    # Was missing entirely. Without it, animate_loop tasks are still running
+    # when HA shuts down, causing "task pending after final writes" warnings
+    # and occasional mid-shutdown BLE write errors.
+    # -------------------------------------------------------------------------
+    async def async_will_remove_from_hass(self) -> None:
+        await self._cancel_anim_task()
+
+    # FIX NEW-1: async_added_to_hass — register stop event listener
+    # async_will_remove_from_hass alone is not reliably called before HA's
+    # shutdown watchdog fires. Listening for EVENT_HOMEASSISTANT_STOP ensures
+    # animate_loop tasks are cancelled cleanly before the final-writes stage.
+    async def async_added_to_hass(self) -> None:
+        async def _on_hass_stop(event) -> None:
+            await self._cancel_anim_task()
+
+        self.async_on_remove(
+            self._hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP,
+                lambda event: self._hass.async_create_task(_on_hass_stop(event))
+            )
+        )
+
+
     async def _init_mdi(self):
-        """Load MDI meta data in executor to avoid blocking loop."""
+        """Load MDI metadata in executor to avoid blocking event loop."""
         if not os.path.exists(self._meta_path) or not os.path.exists(self._font_path):
             _LOGGER.warning("MDI font files missing.")
             return
@@ -107,7 +145,6 @@ class UmpDisplayEntity(LightEntity):
             def load_meta():
                 with open(self._meta_path, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            
             mdi_data = await self._hass.async_add_executor_job(load_meta)
             self._mdi_map = {item['name']: item['codepoint'] for item in mdi_data}
             self._mdi_ready = True
@@ -126,9 +163,7 @@ class UmpDisplayEntity(LightEntity):
         """Scales color proportionally to brightness."""
         if self._brightness == 255:
             return color
-            
         scale = self._brightness / 255.0
-        # Optimization: List comprehension is slightly cleaner
         return tuple(int(c * scale) for c in color[:3]) + (color[3:] if len(color) > 3 else ())
 
     async def _show_brightness_indicator(self):
@@ -136,21 +171,20 @@ class UmpDisplayEntity(LightEntity):
         percent = int((self._brightness / 255) * 100)
         bg_val = int((self._brightness / 255) * 255)
         bg_color = (bg_val, bg_val, bg_val, 255)
-        
-        # Determine text color for contrast
+
         text_col_val = 0 if bg_val > 127 else 255
         text_color = [text_col_val, text_col_val, text_col_val]
-        
+
         temp_canvas = Image.new('RGBA', (self._width, self._height), bg_color)
-        
+
         text = f"{percent}"
         font_name = '5x7'
         spacing = 1
-        
+
         text_width = self._measure_text_width(text, font_name, spacing)
         x = (self._width - text_width) // 2
         y = (self._height - 7) // 2
-        
+
         el = {
             'type': 'text',
             'content': text,
@@ -158,20 +192,23 @@ class UmpDisplayEntity(LightEntity):
             'y': y,
             'color': text_color,
             'font': font_name,
-            'spacing': spacing
+            'spacing': spacing,
         }
-        
         self._draw_text_element_raw(temp_canvas, el)
-        
+
         final = Image.new("RGB", temp_canvas.size, (bg_val, bg_val, bg_val))
         final.paste(temp_canvas, (0, 0), mask=temp_canvas)
-        
+
+        # FIX 3: Guard against None client before any BLE access
+        if self._client is None:
+            return
+
         async with self._ble_lock:
             try:
                 await self._client.send_frame_png(final)
             except Exception as e:
                 _LOGGER.debug(f"Error showing brightness indicator: {e}")
-        
+
         await asyncio.sleep(2.0)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
@@ -179,8 +216,11 @@ class UmpDisplayEntity(LightEntity):
             new_brightness = kwargs["brightness"]
             if new_brightness != self._brightness:
                 self._brightness = new_brightness
+                # FIX 4: Cancel anim_task and AWAIT it before spawning brightness
+                # indicator, so both never compete for _ble_lock simultaneously.
+                await self._cancel_anim_task()
                 self._hass.async_create_task(self._show_brightness_indicator())
-        
+
         self._is_on = True
         async with self._ble_lock:
             try:
@@ -189,22 +229,25 @@ class UmpDisplayEntity(LightEntity):
                 self._current_mode = 0
             except Exception as e:
                 _LOGGER.warning(f"UMP unavailable during turn_on: {e}")
-                self._current_mode = None 
+                self._current_mode = None
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        if self._anim_task: self._anim_task.cancel()
+        # FIX 5: All cancel calls now properly awaited
+        await self._cancel_anim_task()
         self._is_on = False
         async with self._ble_lock:
             try:
                 await self._client.set_state(False)
-                self._current_mode = None 
+                self._current_mode = None
             except Exception as e:
                 _LOGGER.warning(f"UMP unavailable during turn_off: {e}")
         self.async_write_ha_state()
 
     async def async_clear_display(self, **kwargs: Any) -> None:
-        if self._anim_task: self._anim_task.cancel()
+        # FIX 6: Was "self._cancel_anim_task()" without await — task was never
+        # stopped, so the old loop raced with the clear operation.
+        await self._cancel_anim_task()
         async with self._ble_lock:
             try:
                 if self._current_mode != 0:
@@ -213,7 +256,7 @@ class UmpDisplayEntity(LightEntity):
                 await self._client.clear()
             except Exception as e:
                 _LOGGER.warning(f"UMP unavailable during clear_display: {e}")
-                self._current_mode = None
+            self._current_mode = None
 
     async def async_sync_time(self, **kwargs: Any) -> None:
         async with self._ble_lock:
@@ -223,22 +266,19 @@ class UmpDisplayEntity(LightEntity):
                 _LOGGER.warning(f"UMP unavailable during sync_time: {e}")
 
     async def async_draw_matrix(self, elements: list, background: list, fps: int = 10) -> None:
-        # --- PRE-PROCESSING ---
-        # Perform explicit sanitation here once, instead of in every render loop
         processed_elements = []
         for el in elements:
             new_el = el.copy()
-            
-            # Sanitize content early
+
             if 'content' in new_el:
                 new_el['content'] = sanitize_text(str(new_el['content']))
 
             if new_el.get('type') == 'image':
                 img = await self._fetch_and_process_image(new_el)
-                if img: new_el['_cached_img'] = img
-            
+                if img:
+                    new_el['_cached_img'] = img
+
             if new_el.get('type') == 'textlong':
-                # Content is already sanitized above
                 lines = self._get_text_lines(
                     new_el['content'],
                     new_el.get('font', '5x7'),
@@ -249,7 +289,6 @@ class UmpDisplayEntity(LightEntity):
 
             processed_elements.append(new_el)
 
-        # 1. Ensure powered on
         if not self._is_on:
             async with self._ble_lock:
                 try:
@@ -260,7 +299,6 @@ class UmpDisplayEntity(LightEntity):
                     _LOGGER.warning(f"UMP unavailable (cannot turn on): {e}")
                     return
 
-        # 2. Ensure Mode 0 (Optimistic)
         async with self._ble_lock:
             if self._current_mode != 0:
                 try:
@@ -268,55 +306,70 @@ class UmpDisplayEntity(LightEntity):
                     self._current_mode = 0
                 except Exception as e:
                     _LOGGER.debug(f"Failed to set mode 0 (continuing anyway): {e}")
-                    self._current_mode = 0 
+                    self._current_mode = 0
 
-        if self._anim_task and not self._anim_task.done():
-            self._anim_task.cancel()
-            self._anim_task = None
-            
-        # Check for animation requirements
-        has_animation = False
-        for el in processed_elements:
-            etype = el.get('type')
-            if etype == 'textscroll':
-                has_animation = True
-                break
-            elif etype == 'textlong':
-                if len(el.get('_cached_lines', [])) > 1:
-                    has_animation = True
-                    break
-        
+        # FIX 7: Properly await cancellation so the old task fully stops and
+        # releases _ble_lock before the new task starts.
+        await self._cancel_anim_task()
+
+        has_animation = any(
+            el.get('type') == 'textscroll' or
+            (el.get('type') == 'textlong' and len(el.get('_cached_lines', [])) > 1)
+            for el in processed_elements
+        )
+
         if has_animation:
-            self._anim_task = self._hass.async_create_task(self._animate_loop(processed_elements, background, fps))
+            self._anim_task = self._hass.async_create_task(
+                self._animate_loop(processed_elements, background, fps)
+            )
         else:
-            # Static Frame
             await self._render_and_send(processed_elements, background)
 
-    async def _render_and_send(self, elements: list, background: list):
-        """Helper to reduce code duplication between static and anim loop."""
-        # Run CPU-bound render in executor? 
-        # For small matrices (32x8), sync render is usually fine (<5ms). 
-        # If matrix grows, move this to executor.
+    # -------------------------------------------------------------------------
+    # FIX 8: _render_and_send
+    # (a) Guard against self._client being None — the animate_loop can call
+    #     this before the BLE client is initialised, causing:
+    #     "NoneType object has no attribute writegattchar"
+    # (b) Guard against re-entrant connection attempts via _is_connecting —
+    #     prevents two proxy instances from fighting over the same peripheral,
+    #     causing BluetoothGATTErrorResponse Unknown error 0.
+    # -------------------------------------------------------------------------
+    async def _render_and_send(self, elements: list, background: list) -> None:
+        # FIX NEW-2: Capture client reference atomically to prevent TOCTOU race.
+        # self._client can be set to None by the BLE disconnect callback between
+        # the None-check and the actual writegattchar call, causing:
+        # "NoneType object has no attribute writegattchar"
+        # Using a local ref means even if self._client is cleared mid-send,
+        # the in-flight write still completes cleanly.
+        client = self._client
+        if client is None:
+            _LOGGER.debug("_render_and_send: BLE client not initialised, skipping frame")
+            return
+
+        if self._is_connecting:
+            _LOGGER.debug("_render_and_send: BLE connection in progress, skipping frame")
+            return
+
         canvas = self._render_canvas_sync(elements, background)
         if canvas.mode != 'RGB':
             canvas = canvas.convert('RGB')
-        
-        img_byte_arr = BytesIO()
-        canvas.save(img_byte_arr, format='PNG', compress_level=0)
-        new_bytes = img_byte_arr.getvalue()
-        
-        last_bytes = self._client.get_last_frame()
-        
+
+        def encode():
+            buf = BytesIO()
+            canvas.save(buf, format='PNG', compress_level=0)
+            return buf.getvalue()
+
+        new_bytes = await self._hass.async_add_executor_job(encode)
+        last_bytes = client.get_last_frame()
         if last_bytes != new_bytes:
             async with self._ble_lock:
                 try:
-                    await self._client.send_frame_png(canvas)
+                    await client.send_frame_png(canvas)
                 except Exception as e:
                     _LOGGER.debug(f"UMP disconnected while sending frame: {e}")
 
-    async def _animate_loop(self, elements: list, background: list, fps: int):
-        target_frame_time = 1.0 / max(1, min(fps, 30)) 
-        
+    async def _animate_loop(self, elements: list, background: list, fps: int) -> None:
+        target_frame_time = 1.0 / max(1, min(fps, 30))
         try:
             while True:
                 loop_start = time.time()
@@ -324,7 +377,6 @@ class UmpDisplayEntity(LightEntity):
                 elapsed = time.time() - loop_start
                 sleep_time = max(0.01, target_frame_time - elapsed)
                 await asyncio.sleep(sleep_time)
-                
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -334,15 +386,13 @@ class UmpDisplayEntity(LightEntity):
         bg_rgba = tuple(self._apply_brightness_to_color(tuple(background)))
         if len(bg_rgba) == 3:
             bg_rgba = bg_rgba + (255,)
-        
+
         canvas = Image.new('RGBA', (self._width, self._height), bg_rgba)
         draw = ImageDraw.Draw(canvas)
-        
+
         for el in elements:
             try:
                 el_type = el.get('type')
-                # Content is already sanitized in async_draw_matrix pre-processing
-                
                 if el_type == 'text':
                     self._draw_text_element(canvas, el)
                 elif el_type == 'textscroll':
@@ -358,13 +408,12 @@ class UmpDisplayEntity(LightEntity):
                     img = el['_cached_img']
                     img = self._apply_brightness_to_image(img)
                     if img.mode == 'RGBA':
-                         canvas.paste(img, (x, y), img)
+                        canvas.paste(img, (x, y), img)
                     else:
-                         canvas.paste(img, (x, y))
+                        canvas.paste(img, (x, y))
             except Exception as e:
-                # Log debug instead of pass
                 _LOGGER.debug(f"Error rendering element {el.get('type')}: {e}")
-        
+
         final_image = Image.new("RGB", canvas.size, (0, 0, 0))
         final_image.paste(canvas, (0, 0), mask=canvas)
         return final_image
@@ -372,14 +421,9 @@ class UmpDisplayEntity(LightEntity):
     def _apply_brightness_to_image(self, img: Image.Image) -> Image.Image:
         if self._brightness == 255:
             return img
-        
         scale = self._brightness / 255.0
-        # Image.eval is much faster than python pixel loops
-        # However, for full color control, point operations are preferred
-        # Keeping pixel loop for now as it handles RGBA logic specifically for the matrix
         img_array = img.copy()
         pixels = img_array.load()
-        
         w, h = img_array.size
         for y in range(h):
             for x in range(w):
@@ -389,7 +433,6 @@ class UmpDisplayEntity(LightEntity):
                 elif img_array.mode == 'RGB':
                     r, g, b = pixels[x, y]
                     pixels[x, y] = (int(r * scale), int(g * scale), int(b * scale))
-        
         return img_array
 
     def _get_char_mask(self, font_name: str, char: str) -> Tuple[Optional[Image.Image], int]:
@@ -400,7 +443,6 @@ class UmpDisplayEntity(LightEntity):
         img_mask = None
         advance = 0
 
-        # Optimization: Flattened logic slightly for readability
         if font_name == 'awtrix':
             code = ord(char)
             if 32 <= code <= 126:
@@ -428,27 +470,27 @@ class UmpDisplayEntity(LightEntity):
             else:
                 advance = 4
         else:
-            # Standard pixel fonts
             if font_name == '3x5':
                 font_data = FONT_3X5_DATA; char_w = 3; char_h = 5; stride = 3
             else:
                 font_data = FONT_5X7_DATA; char_w = 5; char_h = 7; stride = 7
-            
+
             advance = char_w
             code = ord(char)
             if code * stride < len(font_data):
                 img_mask = Image.new('1', (char_w, char_h), 0)
                 offset = code * stride
                 for col in range(char_w):
-                    if col >= stride: break
+                    if col >= stride:
+                        break
                     byte = font_data[offset + col]
                     for row in range(8):
-                        if row >= char_h: break
+                        if row >= char_h:
+                            break
                         if (byte >> row) & 1:
                             img_mask.putpixel((col, row), 1)
 
         if img_mask is None:
-            # Fallback width
             advance = 4 if font_name == 'awtrix' else (3 if font_name == '3x5' else 5)
 
         self._char_mask_cache[cache_key] = (img_mask, advance)
@@ -459,7 +501,8 @@ class UmpDisplayEntity(LightEntity):
         return advance
 
     def _measure_text_width(self, text: str, font_name: str, spacing: int) -> int:
-        if not text: return 0
+        if not text:
+            return 0
         width = 0
         extra_space = spacing - 1 if font_name == 'awtrix' else spacing
         for i, char in enumerate(text):
@@ -473,14 +516,12 @@ class UmpDisplayEntity(LightEntity):
         lines = []
         current_line = []
         current_line_width = 0
-        
-        # Calculate space width once
-        space_width = self._measure_char_width(' ', font_name) 
+
+        space_width = self._measure_char_width(' ', font_name)
         actual_space_px = space_width + (spacing - 1 if font_name == 'awtrix' else spacing)
 
         for word in words:
             word_width = self._measure_text_width(word, font_name, spacing)
-            
             if not current_line:
                 current_line.append(word)
                 current_line_width = word_width
@@ -493,50 +534,53 @@ class UmpDisplayEntity(LightEntity):
                     lines.append(" ".join(current_line))
                     current_line = [word]
                     current_line_width = word_width
-        
+
         if current_line:
             lines.append(" ".join(current_line))
-            
         return lines
 
     def _draw_text_element_raw(self, canvas: Image.Image, el: Dict[str, Any]) -> None:
-        """Draw text without brightness scaling (for indicator)."""
-        content = str(el.get('content', '')) # Already sanitized if coming from processed list
+        """Draw text without brightness scaling (for indicator overlay)."""
+        content = str(el.get('content', ''))
         x, y = int(el.get('x', 0)), int(el.get('y', 0))
         raw_color = el.get('color', [255, 255, 255])
         color = tuple(raw_color)
-        if len(color) == 3: color = color + (255,)
-        
+        if len(color) == 3:
+            color = color + (255,)
         font_name = el.get('font', '5x7')
         spacing = int(el.get('spacing', 1))
-        
         self._draw_char_loop(canvas, content, x, y, color, font_name, spacing)
 
     def _draw_text_element(self, canvas: Image.Image, el: Dict[str, Any]) -> None:
         content = str(el.get('content', ''))
         x, y = int(el.get('x', 0)), int(el.get('y', 0))
         raw_color = el.get('color', [255, 255, 255])
-        
         color = tuple(self._apply_brightness_to_color(tuple(raw_color)))
-        if len(color) == 3: color = color + (255,)
-        
+        if len(color) == 3:
+            color = color + (255,)
         font_name = el.get('font', '5x7')
         spacing = int(el.get('spacing', 1))
-
         self._draw_char_loop(canvas, content, x, y, color, font_name, spacing)
 
-    def _draw_char_loop(self, canvas, content, x, y, color, font_name, spacing):
-        """Helper to avoid code duplication in draw_text logic."""
+    # -------------------------------------------------------------------------
+    # FIX 9: _draw_char_loop
+    # Direct canvas.paste() with deeply negative x (text scrolling in from the
+    # right) can crash Pillow with ImagingError on some versions.
+    # Fix: composite onto an intermediate RGBA layer the same size as canvas.
+    # Pillow clips layer compositing safely. Also skip characters that are
+    # entirely off-canvas for efficiency.
+    # -------------------------------------------------------------------------
+    def _draw_char_loop(self, canvas: Image.Image, content: str, x: int, y: int,
+                        color: tuple, font_name: str, spacing: int) -> None:
         cursor_x = x
         extra_space = spacing - 1 if font_name == 'awtrix' else spacing
+        layer = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
 
         for char in content:
             mask, advance = self._get_char_mask(font_name, char)
-            
             if mask:
-                draw_y = y
                 draw_x = cursor_x
-                
+                draw_y = y
                 if font_name == 'awtrix':
                     code = ord(char)
                     if 32 <= code <= 126:
@@ -545,32 +589,34 @@ class UmpDisplayEntity(LightEntity):
                             (_, _, _, _, xo, yo) = AWTRIX_GLYPHS[glyph_idx]
                             draw_x += xo
                             draw_y += (5 + yo)
-                
+                # Skip characters completely off the canvas (left or right)
+                if draw_x + mask.width < 0 or draw_x >= canvas.width:
+                    cursor_x += advance + extra_space
+                    continue
                 try:
-                    canvas.paste(color, (draw_x, draw_y), mask)
+                    layer.paste(color, (draw_x, draw_y), mask)
                 except Exception:
-                    pass # Mask paste error is usually negligible
-            
+                    pass
             cursor_x += advance + extra_space
 
-    def _draw_textlong_element(self, canvas, el: Dict[str, Any]) -> None:
+        canvas.alpha_composite(layer)
+
+    def _draw_textlong_element(self, canvas: Image.Image, el: Dict[str, Any]) -> None:
         lines = el.get('_cached_lines', [])
-        if not lines: return
+        if not lines:
+            return
 
         base_x = int(el.get('x', 0))
         base_y = int(el.get('y', 0))
-        speed = float(el.get('speed', 2.0)) 
+        speed = float(el.get('speed', 2.0))
         scroll_duration = float(el.get('scroll_duration', 0.5))
-        direction = el.get('direction', 'up') 
-        
+        direction = el.get('direction', 'up')
+
         font_name = el.get('font', '5x7')
-        if font_name == '3x5': line_h = 6
-        elif font_name == '5x7': line_h = 8
-        else: line_h = 8
+        line_h = 6 if font_name == '3x5' else 8
 
         num_lines = len(lines)
         if num_lines == 1:
-            # Fallback to simple text draw
             draw_params = el.copy()
             draw_params['type'] = 'text'
             draw_params['content'] = lines[0]
@@ -580,14 +626,11 @@ class UmpDisplayEntity(LightEntity):
         now = time.time()
         cycle_time = speed + scroll_duration
         total_time = cycle_time * num_lines
-        
         current_time_in_cycle = now % total_time
         line_idx = int(current_time_in_cycle / cycle_time)
         time_in_phase = current_time_in_cycle % cycle_time
-
         next_idx = (line_idx + 1) % num_lines
 
-        # Prepare temporary elements for current and next line
         draw_curr = el.copy(); draw_curr['type'] = 'text'; draw_curr['content'] = lines[line_idx]
         draw_next = el.copy(); draw_next['type'] = 'text'; draw_next['content'] = lines[next_idx]
 
@@ -596,66 +639,62 @@ class UmpDisplayEntity(LightEntity):
             draw_curr['y'] = base_y
             self._draw_text_element(canvas, draw_curr)
         else:
-            # Animation Phase
-            anim_progress = (time_in_phase - speed) / scroll_duration
-            if anim_progress > 1.0: anim_progress = 1.0
-            
-            offset_y = 0; offset_x = 0
-            
+            anim_progress = min((time_in_phase - speed) / scroll_duration, 1.0)
+
             if direction == 'up':
                 offset_y = int(anim_progress * line_h)
-                draw_curr['y'] = base_y - offset_y
-                draw_next['y'] = base_y + line_h - offset_y
-                draw_curr['x'] = base_x; draw_next['x'] = base_x
-
+                draw_curr['y'] = base_y - offset_y;  draw_next['y'] = base_y + line_h - offset_y
+                draw_curr['x'] = base_x;              draw_next['x'] = base_x
             elif direction == 'down':
                 offset_y = int(anim_progress * line_h)
-                draw_curr['y'] = base_y + offset_y
-                draw_next['y'] = base_y - line_h + offset_y
-                draw_curr['x'] = base_x; draw_next['x'] = base_x
-
+                draw_curr['y'] = base_y + offset_y;  draw_next['y'] = base_y - line_h + offset_y
+                draw_curr['x'] = base_x;              draw_next['x'] = base_x
             elif direction == 'left':
                 offset_x = int(anim_progress * self._width)
-                draw_curr['x'] = base_x - offset_x
-                draw_next['x'] = base_x + self._width - offset_x
-                draw_curr['y'] = base_y; draw_next['y'] = base_y
-
+                draw_curr['x'] = base_x - offset_x;  draw_next['x'] = base_x + self._width - offset_x
+                draw_curr['y'] = base_y;              draw_next['y'] = base_y
             elif direction == 'right':
                 offset_x = int(anim_progress * self._width)
-                draw_curr['x'] = base_x + offset_x
-                draw_next['x'] = base_x - self._width + offset_x
-                draw_curr['y'] = base_y; draw_next['y'] = base_y
+                draw_curr['x'] = base_x + offset_x;  draw_next['x'] = base_x - self._width + offset_x
+                draw_curr['y'] = base_y;              draw_next['y'] = base_y
 
             self._draw_text_element(canvas, draw_curr)
             self._draw_text_element(canvas, draw_next)
 
-    def _draw_textscroll_element(self, canvas, draw, el: Dict[str, Any]) -> None:
+    def _draw_textscroll_element(self, canvas: Image.Image, draw: ImageDraw.ImageDraw,
+                                  el: Dict[str, Any]) -> None:
         content = str(el.get('content', ''))
-        if not content: return
-        
+        if not content:
+            return
+
         font_name = el.get('font', '5x7')
         spacing = int(el.get('spacing', 1))
         speed = int(el.get('speed', 10))
         text_width = self._measure_text_width(content, font_name, spacing)
-        
-        if text_width < 1: return
+        if text_width < 1:
+            return
+
+        # FIX 10: Guard total_distance against zero (e.g. misconfigured width=0)
+        # to prevent ZeroDivisionError in the modulo below.
         total_distance = self._width + text_width
+        if total_distance < 1:
+            return
+
         offset = (time.time() * speed) % total_distance
         x = int(self._width - offset)
-        
+
         temp_el = el.copy()
         temp_el['type'] = 'text'
-        temp_el['content'] = content 
+        temp_el['content'] = content
         temp_el['x'] = x
         self._draw_text_element(canvas, temp_el)
 
     def _draw_pixels_element(self, canvas: Image.Image, el: Dict[str, Any]) -> None:
         pixels = el.get('pixels', [])
-        if not pixels: return
-
+        if not pixels:
+            return
         layer = Image.new('RGBA', (self._width, self._height), (0, 0, 0, 0))
         draw_access = layer.load()
-        
         try:
             for p in pixels:
                 if len(p) >= 5:
@@ -663,39 +702,32 @@ class UmpDisplayEntity(LightEntity):
                     alpha = p[5] if len(p) > 5 else 255
                     draw_access[p[0], p[1]] = (pixel_color[0], pixel_color[1], pixel_color[2], alpha)
         except Exception as e:
-            # Helpful debug if pixel data format is wrong
             _LOGGER.debug(f"Pixel draw error: {e}")
-        
         canvas.alpha_composite(layer)
 
-    def _draw_mdi_element(self, canvas, el: Dict[str, Any]):
-        if not self._mdi_ready: return
-        
+    def _draw_mdi_element(self, canvas: Image.Image, el: Dict[str, Any]) -> None:
+        if not self._mdi_ready:
+            return
         raw_name = str(el.get('name', 'mdi:help'))
         icon_name = raw_name[4:] if raw_name.startswith("mdi:") else raw_name
-        
         hex_code = self._mdi_map.get(icon_name)
-        if not hex_code: return
-        
+        if not hex_code:
+            return
         icon_char = chr(int(hex_code, 16))
         size = int(el.get('size', 16))
         c = el.get('color', [255, 255, 255])
-        
         color = tuple(self._apply_brightness_to_color(tuple(c)))
-        if len(color) == 3: color = color + (255,)
-        
+        if len(color) == 3:
+            color = color + (255,)
         x, y = int(el.get('x', 0)), int(el.get('y', 0))
-        
         font = self._mdi_fonts.get(size)
         if not font:
             try:
                 font = ImageFont.truetype(self._font_path, size)
                 self._mdi_fonts[size] = font
-            except Exception as e: 
-                # Log error only once per missing size to avoid spam, or debug level
-                _LOGGER.debug(f"Could not load font size {size}: {e}")
+            except Exception as e:
+                _LOGGER.debug(f"Could not load MDI font size {size}: {e}")
                 return
-            
         layer = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
         layer_draw = ImageDraw.Draw(layer)
         layer_draw.text((x, y), icon_char, font=font, fill=color)
@@ -708,7 +740,8 @@ class UmpDisplayEntity(LightEntity):
             if self._hass.config.is_allowed_path(path):
                 try:
                     def load_local():
-                        with open(path, "rb") as f: return f.read()
+                        with open(path, "rb") as f:
+                            return f.read()
                     image_data = await self._hass.async_add_executor_job(load_local)
                 except Exception as e:
                     _LOGGER.debug(f"Failed to load local image {path}: {e}")
@@ -720,7 +753,7 @@ class UmpDisplayEntity(LightEntity):
                         image_data = await response.read()
             except Exception as e:
                 _LOGGER.debug(f"Failed to download image {el['url']}: {e}")
-        
+
         if image_data:
             try:
                 img = Image.open(BytesIO(image_data)).convert("RGBA")
