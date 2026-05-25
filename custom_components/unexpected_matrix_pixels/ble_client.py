@@ -37,32 +37,57 @@ class UmpBleClient:
     def get_last_frame(self) -> bytes | None:
         return self._last_image_bytes
 
+    # async def ensure_connected(self) -> None:
+        # if self._client and self._client.is_connected:
+        #     return
+        # async with self._lock:
+        #     if self._client and self._client.is_connected:
+        #         return
+            
+        #     device = bluetooth.async_ble_device_from_address(self._hass, self._mac, connectable=True)
+        #     if device is None:
+        #         raise ConnectionError(f"UMP {self._mac} not available")
+            
+        #     name = device.name or ""
+        #     if "LED_BLE" in name:
+        #         self._is_led_ble = True  # iPixel needs reliable writes
+        #     else:
+        #         self._is_led_ble = False # IDM works fine with fast writes
+                
+        #     try:
+        #         self._client = await establish_connection(
+        #             BleakClient,
+        #             device,
+        #             self._mac,
+        #             disconnected_callback=self._on_disconnect,
+        #         )
+        #     except Exception as e:
+        #         raise ConnectionError(f"Failed to connect to UMP {self._mac}") from e
+
     async def ensure_connected(self) -> None:
         if self._client and self._client.is_connected:
             return
         async with self._lock:
             if self._client and self._client.is_connected:
                 return
-            
-            device = bluetooth.async_ble_device_from_address(self._hass, self._mac, connectable=True)
+            device = bluetooth.async_ble_device_from_address(
+                self._hass, self._mac, connectable=True
+            )
             if device is None:
                 raise ConnectionError(f"UMP {self._mac} not available")
-            
-            name = device.name or ""
-            if "LED_BLE" in name:
-                self._is_led_ble = True  # iPixel needs reliable writes
-            else:
-                self._is_led_ble = False # IDM works fine with fast writes
-                
             try:
                 self._client = await establish_connection(
                     BleakClient,
                     device,
                     self._mac,
                     disconnected_callback=self._on_disconnect,
+                    max_attempts=2,        # don't hammer the proxy
                 )
             except Exception as e:
+                await asyncio.sleep(2.0)   # back off before next attempt
                 raise ConnectionError(f"Failed to connect to UMP {self._mac}") from e
+
+
 
     def _on_disconnect(self, client: BleakClient) -> None:
         self._client = None
